@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Jednoduchá střílečka ala Doom – Health Pack & Enemy Shooting</title>
+  <style>
+    body { margin: 0; overflow: hidden; }
+    canvas { display: block; background: #333; }
+  </style>
+</head>
+<body>
+  <canvas id="gameCanvas"></canvas>
+  <script>
+    // Nastavení canvasu
+    const canvas = document.getElementById("gameCanvas");
+    const ctx = canvas.getContext("2d");
+    canvas.width = 640;
+    canvas.height = 480;
+
+    // Globální proměnné
+    let shootFlashTime = 0;
+    let canShoot = true;
+    let explosions = [];  // aktivní exploze
+    let kills = 0;        // počet zabitých nepřátel
+    let playerHurtTime = 0; // efekt zásahu hráče (červený překryv)
+    let healthPack = null;  // lekárnička
+
+    // Konstanty pro spawnování a bezpečný odstup
+    const MIN_SPAWN_DISTANCE = 5;      // nepřátelé a health pack se spawnnou alespoň 5 jednotek od hráče
+    const MIN_ENEMY_SPACING = 3;         // nepřátelé musí být od sebe minimálně 3 jednotky
+    const TARGET_ENEMY_COUNT = 5;        // chceme mít na mapě vždy 5 nepřátel
+    const SAFE_DISTANCE = 2.0;           // nepřátelé se nikdy nepřiblíží k hráči blíž než 2 jednotky
+
+    // Definice mapy (10x10 mřížka) – 0 = volný prostor, 1 = zeď
+    const map = [
+      [1,1,1,1,1,1,1,1,1,1],
+      [1,0,0,0,0,0,0,0,0,1],
+      [1,0,1,0,1,1,1,0,0,1],
+      [1,0,1,0,0,0,1,0,0,1],
+      [1,0,1,1,1,0,1,0,0,1],
+      [1,0,0,0,1,0,1,0,0,1],
+      [1,0,1,0,1,0,1,0,0,1],
+      [1,0,1,0,0,0,0,0,0,1],
+      [1,0,0,0,0,0,0,0,0,1],
+      [1,1,1,1,1,1,1,1,1,1]
+    ];
+
+    // Nastavení hráče (včetně HP)
+    let player = {
+      x: 3.5,
+      y: 3.5,
+      angle: 0,
+      moveSpeed: 3.0,
+      rotSpeed: 2.0,
+      hp: 100
+    };
+
+    const FOV = Math.PI / 3;
+
+    // Počáteční nepřátelé – mají vlastnosti shootCooldown a muzzleFlashTime
+    let enemies = [
+      { x: 6.5, y: 3.5, speed: 1.0, walkCycle: 0, shootCooldown: 0, muzzleFlashTime: 0 },
+      { x: 2.5, y: 7.5, speed: 1.2, walkCycle: 0, shootCooldown: 0, muzzleFlashTime: 0 },
+      { x: 5.5, y: 7.5, speed: 1.1, walkCycle: 0, shootCooldown: 0, muzzleFlashTime: 0 }
+    ];
+
+    // Zpracování vstupu z klávesnice
+    const keys = {};
+    document.addEventListener("keydown", function(e) {
+      keys[e.key] = true;
+      if(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.key)) {
+        e.preventDefault();
+      }
+      if(e.code === "Space"){
+        if(canShoot){
+          shoot();
+          canShoot = false;
+        }
+        e.preventDefault();
+      }
+    });
+    document.addEventListener("keyup", function(e) {
+      keys[e.key] = false;
+      if(e.code === "Space"){
+        canShoot = true;
+      }
+    });
+
+    // Funkce pro kontrolu viditelnosti objektu (pouze zdi)
+    function isEnemyVisible(obj) {
+      let dx = obj.x - player.x;
+      let dy = obj.y - player.y;
+      let distance = Math.sqrt(dx * dx + dy * dy);
+      let steps = Math.ceil(distance / 0.1);
+      let stepX = dx / steps;
+      let stepY = dy / steps;
+      let rayX = player.x;
+      let rayY = player.y;
+      for (let i = 0; i < steps; i++) {
+        rayX += stepX;
+        rayY += stepY;
+        if (map[Math.floor(rayY)][Math.floor(rayX)] !== 0) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    // Funkce pro střelbu hráče – hledá nejbližší viditelného nepřítele ve středu pohledu
+    function shoot(){
+      shootFlashTime = 0.1;
+      console.log("Hráč střílí!");
+      const hitThreshold = 0.1;
+      let bestEnemyIndex = -1;
+      let bestDistance = Infinity;
+      enemies.forEach((enemy, index) => {
+        if (!isEnemyVisible(enemy)) return;
+        let dx = enemy.x - player.x;
+        let dy = enemy.y - player.y;
+        let distance = Math.sqrt(dx * dx + dy * dy);
+        let relativeAngle = Math.atan2(dy, dx) - player.angle;
+        while(relativeAngle < -Math.PI) relativeAngle += 2 * Math.PI;
+        while(relativeAngle > Math.PI) relativeAngle -= 2 * Math.PI;
+        if(Math.abs(relativeAngle) < hitThreshold && distance < bestDistance){
+          bestDistance = distance;
+          bestEnemyIndex = index;
+        }
+      });
+      if(bestEnemyIndex >= 0){
+        let enemy = enemies[bestEnemyIndex];
+        explosions.push({ x: enemy.x, y: enemy.y, timer: 0.5, lifetime: 0.5 });
+        enemies.splice(bestEnemyIndex, 1);
+        kills++;
+        let newEnemy = spawnEnemy();
+        if(newEnemy) {
+          enemies.push(newEnemy);
+        }
+      }
+    }
+
+    // Funkce pro spawnování nepřátel
+    function spawnEnemy() {
+      const maxAttempts = 100;
+      for (let i = 0; i < maxAttempts; i++) {
+        let cellX = Math.floor(Math.random() * map[0].length);
+        let cellY = Math.floor(Math.random() * map.length);
+        if(map[cellY][cellX] !== 0) continue;
+        let enemyX = cellX + 0.5;
+        let enemyY = cellY + 0.5;
+        let dx = enemyX - player.x;
+        let dy = enemyY - player.y;
+        let dist = Math.sqrt(dx * dx + dy * dy);
+        if(dist < MIN_SPAWN_DISTANCE) continue;
+        let relativeAngle = Math.atan2(dy, dx) - player.angle;
+        while(relativeAngle < -Math.PI) relativeAngle += 2 * Math.PI;
+        while(relativeAngle > Math.PI) relativeAngle -= 2 * Math.PI;
+        if(Math.abs(relativeAngle) < FOV/2 + 0.5) continue;
+        let tooClose = false;
+        enemies.forEach(e => {
+          let d = Math.sqrt((enemyX - e.x) ** 2 + (enemyY - e.y) ** 2);
+          if(d < MIN_ENEMY_SPACING) tooClose = true;
+        });
+        if(tooClose) continue;
+        return {
+          x: enemyX,
+          y: enemyY,
+          speed: 1.0 + Math.random() * 0.5,
+          walkCycle: 0,
+          wanderAngle: Math.random() * Math.PI * 2,
+          shootCooldown: 0,
+          muzzleFlashTime: 0
+        };
+      }
+      return null;
+    }
+
+    // Funkce pro spawnování lekárničky (health pack)
+    function spawnHealthPack() {
+      const maxAttempts = 100;
+      for (let i = 0; i < maxAttempts; i++) {
+        let cellX = Math.floor(Math.random() * map[0].length);
+        let cellY = Math.floor(Math.random() * map.length);
+        if(map[cellY][cellX] !== 0) continue;
+        let packX = cellX + 0.5;
+        let packY = cellY + 0.5;
+        let dx = packX - player.x;
+        let dy = packY - player.y;
+        let dist = Math.sqrt(dx * dx + dy * dy);
+        if(dist < MIN_SPAWN_DISTANCE) continue;
+        let relativeAngle = Math.atan2(dy, dx) - player.angle;
+        while(relativeAngle < -Math.PI) relativeAngle += 2 * Math.PI;
+        while(relativeAngle > Math.PI) relativeAngle -= 2 * Math.PI;
+        if(Math.abs(relativeAngle) > FOV/2 + 0.5) continue;
+        let tooClose = false;
+        enemies.forEach(e => {
+          let d = Math.sqrt((packX - e.x) ** 2 + (packY - e.y) ** 2);
+          if(d < MIN_ENEMY_SPACING) tooClose = true;
+        });
+        if(tooClose) continue;
+        return { x: packX, y: packY };
+      }
+      return null;
+    }
+
+    // Hlavní herní smyčka
+    let lastTime = performance.now();
+    function gameLoop(time){
+      let dt = (time - lastTime) / 1000;
+      lastTime = time;
+      update(dt);
+      render();
+      requestAnimationFrame(gameLoop);
+    }
+    requestAnimationFrame(gameLoop);
+
+    // Aktualizace stavu hry
+    function update(dt){
+      // Pohyb hráče
+      if(keys["ArrowLeft"]){
+        player.angle -= player.rotSpeed * dt;
+      }
+      if(keys["ArrowRight"]){
+        player.angle += player.rotSpeed * dt;
+      }
+      let moveStep = 0;
+      if(keys["ArrowUp"]){
+        moveStep = player.moveSpeed * dt;
+      }
+      if(keys["ArrowDown"]){
+        moveStep = -player.moveSpeed * dt;
+      }
+      if(moveStep !== 0){
+        let newX = player.x + Math.cos(player.angle) * moveStep;
+        let newY = player.y + Math.sin(player.angle) * moveStep;
+        if(map[Math.floor(newY)][Math.floor(newX)] === 0){
+          player.x = newX;
+          player.y = newY;
+        }
+      }
+      
+      // Kontrola, zda hráč sebral lekárničku
+      if(healthPack) {
+        let dx = healthPack.x - player.x;
+        let dy = healthPack.y - player.y;
+        let dist = Math.sqrt(dx * dx + dy * dy);
+        if(dist < 0.7) {
+          player.hp += 20;
+          if(player.hp > 100) player.hp = 100;
+          healthPack = null;
+        }
+      }
+      if(!healthPack) {
+        healthPack = spawnHealthPack();
+      }
+      
+      // Aktualizace nepřátel
+      enemies.forEach(enemy => {
+        let dx = player.x - enemy.x;
+        let dy = player.y - enemy.y;
+        let dist = Math.sqrt(dx * dx + dy * dy);
+        if(dist < SAFE_DISTANCE) {
+          enemy.angle = Math.atan2(player.y - enemy.y, player.x - enemy.x);
+          enemy.walkCycle = (enemy.walkCycle || 0) + dt * enemy.speed * 5;
+        } else {
+          if(enemy.wanderAngle === undefined) {
+            enemy.wanderAngle = Math.random() * Math.PI * 2;
+          }
+          enemy.wanderAngle += (Math.random() - 0.5) * 0.2;
+          let chaseX = (dist !== 0 ? dx / dist : 0);
+          let chaseY = (dist !== 0 ? dy / dist : 0);
+          let wanderX = Math.cos(enemy.wanderAngle);
+          let wanderY = Math.sin(enemy.wanderAngle);
+          let weightChase = 0.8;
+          let weightWander = 0.5;
+          let combinedX = chaseX * weightChase + wanderX * weightWander;
+          let combinedY = chaseY * weightChase + wanderY * weightWander;
+          let len = Math.sqrt(combinedX * combinedX + combinedY * combinedY);
+          if(len !== 0){
+            combinedX /= len;
+            combinedY /= len;
+          }
+          let moveX = combinedX * enemy.speed * dt;
+          let moveY = combinedY * enemy.speed * dt;
+          if(map[Math.floor(enemy.y + moveY)][Math.floor(enemy.x + moveX)] === 0){
+            enemy.x += moveX;
+            enemy.y += moveY;
+          }
+          enemy.angle = Math.atan2(player.y - enemy.y, player.x - enemy.x);
+          enemy.walkCycle = (enemy.walkCycle || 0) + dt * enemy.speed * 5;
+        }
+        
+        // Nepřátelská střelba
+        enemy.shootCooldown = (enemy.shootCooldown || 0) - dt;
+        if(enemy.shootCooldown <= 0 && isEnemyVisible(enemy)) {
+          if(Math.random() < 0.5) {
+            if(Math.random() < 0.7) {
+              player.hp -= 10;
+              playerHurtTime = 0.3;
+            }
+            enemy.muzzleFlashTime = 0.1;
+          }
+          enemy.shootCooldown = 1 + Math.random() * 2;
+        }
+        if(enemy.muzzleFlashTime > 0) {
+          enemy.muzzleFlashTime -= dt;
+          if(enemy.muzzleFlashTime < 0) enemy.muzzleFlashTime = 0;
+        }
+      });
+      
+      // Spawn nepřátel
+      while(enemies.length < TARGET_ENEMY_COUNT) {
+        let newEnemy = spawnEnemy();
+        if(newEnemy) {
+          enemies.push(newEnemy);
+        } else {
+          break;
+        }
+      }
+      
+      if(shootFlashTime > 0){
+        shootFlashTime -= dt;
+        if(shootFlashTime < 0) shootFlashTime = 0;
+      }
+      
+      explosions.forEach(exp => { exp.timer -= dt; });
+      explosions = explosions.filter(exp => exp.timer > 0);
+      
+      if(playerHurtTime > 0){
+        playerHurtTime -= dt;
+        if(playerHurtTime < 0) playerHurtTime = 0;
+      }
+    }
+
+    // Vykreslení scény
+    function render(){
+      ctx.fillStyle = "skyblue";
+      ctx.fillRect(0, 0, canvas.width, canvas.height / 2);
+      ctx.fillStyle = "darkgray";
+      ctx.fillRect(0, canvas.height / 2, canvas.width, canvas.height / 2);
+
+      for(let x = 0; x < canvas.width; x++){
+        let rayAngle = (player.angle - FOV / 2) + (x / canvas.width) * FOV;
+        let rayDirX = Math.cos(rayAngle);
+        let rayDirY = Math.sin(rayAngle);
+        let mapX = Math.floor(player.x);
+        let mapY = Math.floor(player.y);
+        let deltaDistX = Math.abs(1 / rayDirX);
+        let deltaDistY = Math.abs(1 / rayDirY);
+        let stepX, stepY;
+        let sideDistX, sideDistY;
+        if(rayDirX < 0){
+          stepX = -1;
+          sideDistX = (player.x - mapX) * deltaDistX;
+        } else {
+          stepX = 1;
+          sideDistX = (mapX + 1.0 - player.x) * deltaDistX;
+        }
+        if(rayDirY < 0){
+          stepY = -1;
+          sideDistY = (player.y - mapY) * deltaDistY;
+        } else {
+          stepY = 1;
+          sideDistY = (mapY + 1.0 - player.y) * deltaDistY;
+        }
+        let hit = 0;
+        let side;
+        while(hit === 0){
+          if(sideDistX < sideDistY){
+            sideDistX += deltaDistX;
+            mapX += stepX;
+            side = 0;
+          } else {
+            sideDistY += deltaDistY;
+            mapY += stepY;
+            side = 1;
+          }
+          if(map[mapY] && map[mapY][mapX] > 0) hit = 1;
+        }
+        let perpWallDist;
+        if(side === 0){
+          perpWallDist = (mapX - player.x + (1 - stepX) / 2) / rayDirX;
+        } else {
+          perpWallDist = (mapY - player.y + (1 - stepY) / 2) / rayDirY;
+        }
+        let lineHeight = Math.floor(canvas.height / perpWallDist);
+        let drawStart = -lineHeight / 2 + canvas.height / 2;
+        if(drawStart < 0) drawStart = 0;
+        let drawEnd = lineHeight / 2 + canvas.height / 2;
+        if(drawEnd >= canvas.height) drawEnd = canvas.height - 1;
+        let color = (side === 0) ? "rgb(200,0,0)" : "rgb(150,0,0)";
+        ctx.fillStyle = color;
+        ctx.fillRect(x, drawStart, 1, drawEnd - drawStart);
+      }
+
+      drawEnemies();
+      drawExplosions();
+      drawWeapon();
+      
+      // Vykreslení lekárničky
+      drawHealthPack();
+      
+      ctx.fillStyle = "white";
+      ctx.font = "20px Arial";
+      ctx.fillText("Kills: " + kills, 10, 30);
+      
+      drawHealthBar();
+      
+      if(playerHurtTime > 0) {
+        ctx.fillStyle = "rgba(255, 0, 0, 0.3)";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+      }
+    }
+
+    // Funkce pro vykreslení nepřátel jako "billboard" postaviček
+    function drawEnemies(){
+      let enemySprites = [];
+      enemies.forEach(enemy => {
+        if (!isEnemyVisible(enemy)) return;
+        let dx = enemy.x - player.x;
+        let dy = enemy.y - player.y;
+        let distance = Math.sqrt(dx * dx + dy * dy);
+        let relativeAngle = Math.atan2(dy, dx) - player.angle;
+        while(relativeAngle < -Math.PI) relativeAngle += 2 * Math.PI;
+        while(relativeAngle > Math.PI) relativeAngle -= 2 * Math.PI;
+        if(Math.abs(relativeAngle) > FOV / 2 + 0.5) return;
+        let correctedDistance = distance * Math.cos(relativeAngle);
+        let spriteHeight = Math.floor(canvas.height / correctedDistance);
+        let spriteWidth = Math.floor(spriteHeight * 0.8);
+        let distToProjPlane = canvas.width / (2 * Math.tan(FOV / 2));
+        let screenX = canvas.width / 2 + (Math.tan(relativeAngle) * distToProjPlane) - spriteWidth / 2;
+        let screenY = (canvas.height / 2) - (spriteHeight / 2);
+        enemySprites.push({
+          distance: distance,
+          screenX: screenX,
+          screenY: screenY,
+          spriteWidth: spriteWidth,
+          spriteHeight: spriteHeight,
+          walkCycle: enemy.walkCycle,
+          muzzleFlash: enemy.muzzleFlashTime
+        });
+      });
+      enemySprites.sort((a, b) => b.distance - a.distance);
+      enemySprites.forEach(sprite => {
+        drawEnemySprite(sprite.screenX, sprite.screenY, sprite.spriteWidth, sprite.spriteHeight, sprite.walkCycle, sprite.muzzleFlash);
+      });
+    }
+
+    // Upravená funkce pro vykreslení nepřátelské postavičky s efektem muzzle flash
+    function drawEnemySprite(screenX, screenY, spriteWidth, spriteHeight, walkCycle, muzzleFlash){
+      ctx.save();
+      ctx.translate(screenX + spriteWidth / 2, screenY + spriteHeight);
+      let bob = Math.sin(walkCycle) * (spriteHeight * 0.05);
+      ctx.translate(0, bob);
+      let bodyWidth = spriteWidth * 0.6;
+      let bodyHeight = spriteHeight * 0.5;
+      ctx.fillStyle = "purple";
+      ctx.fillRect(-bodyWidth / 2, -bodyHeight, bodyWidth, bodyHeight);
+      let headRadius = bodyWidth * 0.35;
+      ctx.fillStyle = "pink";
+      ctx.beginPath();
+      ctx.arc(0, -bodyHeight - headRadius, headRadius, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = "black";
+      let eyeRadius = headRadius * 0.15;
+      ctx.beginPath();
+      ctx.arc(-headRadius * 0.4, -bodyHeight - headRadius, eyeRadius, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(headRadius * 0.4, -bodyHeight - headRadius, eyeRadius, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = "purple";
+      let armWidth = bodyWidth * 0.15;
+      let armHeight = bodyHeight * 0.6;
+      ctx.fillRect(-bodyWidth / 2 - armWidth, -bodyHeight + bodyHeight * 0.2, armWidth, armHeight);
+      ctx.fillRect(bodyWidth / 2, -bodyHeight + bodyHeight * 0.2, armWidth, armHeight);
+      ctx.fillStyle = "darkblue";
+      ctx.beginPath();
+      ctx.moveTo(-bodyWidth * 0.2, 0);
+      ctx.lineTo(-bodyWidth * 0.1, 0);
+      ctx.lineTo(-bodyWidth * 0.15, bodyHeight * 0.4);
+      ctx.closePath();
+      ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(bodyWidth * 0.2, 0);
+      ctx.lineTo(bodyWidth * 0.1, 0);
+      ctx.lineTo(bodyWidth * 0.15, bodyHeight * 0.4);
+      ctx.closePath();
+      ctx.fill();
+      
+      // Upravený muzzle flash efekt – posunutý ještě níže (o 60 % výšky těla)
+      if(muzzleFlash > 0) {
+        ctx.fillStyle = "orange";
+        ctx.beginPath();
+        ctx.arc(bodyWidth * 0.3, -bodyHeight + (bodyHeight * 0.6), headRadius * 0.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      
+      ctx.restore();
+    }
+
+    // Funkce pro vykreslení exploze – animace s kombinací tvarů
+    function drawExplosions(){
+      explosions.forEach(exp => {
+        let dx = exp.x - player.x;
+        let dy = exp.y - player.y;
+        let distance = Math.sqrt(dx * dx + dy * dy);
+        let relativeAngle = Math.atan2(dy, dx) - player.angle;
+        while(relativeAngle < -Math.PI) relativeAngle += 2 * Math.PI;
+        while(relativeAngle > Math.PI) relativeAngle -= 2 * Math.PI;
+        let correctedDistance = distance * Math.cos(relativeAngle);
+        if(correctedDistance <= 0) return;
+        let spriteHeight = Math.floor(canvas.height / correctedDistance);
+        let spriteWidth = Math.floor(spriteHeight * 0.8);
+        let distToProjPlane = canvas.width / (2 * Math.tan(FOV/2));
+        let screenX = canvas.width / 2 + (Math.tan(relativeAngle) * distToProjPlane) - spriteWidth / 2;
+        let screenY = (canvas.height / 2) - (spriteHeight / 2);
+        let progress = 1 - (exp.timer / exp.lifetime);
+        ctx.save();
+        ctx.globalAlpha = 1 - progress;
+        ctx.translate(screenX + spriteWidth/2, screenY + spriteHeight/2);
+        let explosionSize = spriteWidth * (1 + progress);
+        ctx.fillStyle = "orange";
+        ctx.beginPath();
+        ctx.arc(0, 0, explosionSize, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = "yellow";
+        ctx.beginPath();
+        ctx.arc(0, 0, explosionSize * 0.5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = "red";
+        ctx.beginPath();
+        ctx.moveTo(0, -explosionSize);
+        ctx.lineTo(explosionSize * 0.3, explosionSize * 0.3);
+        ctx.lineTo(-explosionSize * 0.3, explosionSize * 0.3);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+      });
+    }
+
+    // Funkce pro vykreslení hráčovy zbraně
+    function drawWeapon(){
+      ctx.save();
+      ctx.translate(canvas.width / 2, canvas.height * 1.05);
+      let weaponWidth = canvas.width * 0.5;
+      let weaponHeight = canvas.height * 0.3;
+      let bodyWidth = weaponWidth * 0.6;
+      let bodyHeight = weaponHeight * 0.4;
+      ctx.fillStyle = "#555";
+      ctx.fillRect(-bodyWidth / 2, -bodyHeight, bodyWidth, bodyHeight);
+      let barrelWidth = bodyWidth * 0.5;
+      let barrelHeight = weaponHeight * 0.4;
+      ctx.fillStyle = "#333";
+      ctx.fillRect(-barrelWidth / 2, -bodyHeight - barrelHeight, barrelWidth, barrelHeight);
+      let guardWidth = bodyWidth * 0.3;
+      let guardHeight = bodyHeight * 0.2;
+      ctx.fillStyle = "#444";
+      ctx.fillRect(-guardWidth / 2, -guardHeight, guardWidth, guardHeight);
+      ctx.fillStyle = "#222";
+      ctx.beginPath();
+      ctx.arc(0, -bodyHeight / 2, bodyHeight * 0.2, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = "#888";
+      ctx.beginPath();
+      ctx.moveTo(0, -bodyHeight - barrelHeight);
+      ctx.lineTo(barrelWidth * 0.3, -bodyHeight - barrelHeight + barrelHeight * 0.3);
+      ctx.lineTo(-barrelWidth * 0.3, -bodyHeight - barrelHeight + barrelHeight * 0.3);
+      ctx.closePath();
+      ctx.fill();
+      if(shootFlashTime > 0){
+        ctx.fillStyle = "yellow";
+        ctx.beginPath();
+        ctx.arc(0, -bodyHeight - barrelHeight, barrelWidth * 0.4, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    // Funkce pro vykreslení ukazatele HP
+    function drawHealthBar() {
+      const barWidth = 200;
+      const barHeight = 20;
+      const x = 10;
+      const y = 60;
+      ctx.fillStyle = "gray";
+      ctx.fillRect(x, y, barWidth, barHeight);
+      let hpPercentage = player.hp / 100;
+      ctx.fillStyle = "forestgreen";
+      ctx.fillRect(x, y, barWidth * hpPercentage, barHeight);
+      ctx.strokeStyle = "white";
+      ctx.strokeRect(x, y, barWidth, barHeight);
+      ctx.fillStyle = "white";
+      ctx.font = "16px Arial";
+      ctx.fillText("HP: " + player.hp + "%", x + 5, y + 15);
+    }
+
+    // Funkce pro vykreslení lekárničky (health pack) jako menší čtvercový objekt s vystředěným červeným křížem
+    // a zároveň kontroluje, zda není zakryta nepřátelskými postavičkami.
+    function drawHealthPack() {
+      if (!healthPack) return;
+      if (!isEnemyVisible(healthPack)) return;
+      let dx = healthPack.x - player.x;
+      let dy = healthPack.y - player.y;
+      let distance = Math.sqrt(dx * dx + dy * dy);
+      let relativeAngle = Math.atan2(dy, dx) - player.angle;
+      while(relativeAngle < -Math.PI) relativeAngle += 2 * Math.PI;
+      while(relativeAngle > Math.PI) relativeAngle -= 2 * Math.PI;
+      if(Math.abs(relativeAngle) > FOV/2 + 0.5) return;
+      let correctedDistance = distance * Math.cos(relativeAngle);
+      // Zmenšujeme velikost health packu (0.5 škálovací faktor)
+      let s = Math.floor(canvas.height / correctedDistance * 0.5);
+      let distToProjPlane = canvas.width / (2 * Math.tan(FOV/2));
+      let screenX = canvas.width / 2 + (Math.tan(relativeAngle) * distToProjPlane) - s / 2;
+      let screenY = (canvas.height / 2) - s / 2;
+      
+      // Kontrola, zda nějaký nepřítel, který je blíže hráči, nepřekrývá tuto oblast.
+      for (let enemy of enemies) {
+        let edx = enemy.x - player.x;
+        let edy = enemy.y - player.y;
+        let enemyDistance = Math.sqrt(edx * edx + edy * edy);
+        if (enemyDistance < distance) { // nepřítel je blíže než health pack
+          let enemyRelativeAngle = Math.atan2(edy, edx) - player.angle;
+          while(enemyRelativeAngle < -Math.PI) enemyRelativeAngle += 2 * Math.PI;
+          while(enemyRelativeAngle > Math.PI) enemyRelativeAngle -= 2 * Math.PI;
+          let enemyCorrectedDistance = enemyDistance * Math.cos(enemyRelativeAngle);
+          let enemySpriteHeight = Math.floor(canvas.height / enemyCorrectedDistance);
+          let enemySpriteWidth = Math.floor(enemySpriteHeight * 0.8);
+          let enemyDistToProjPlane = canvas.width / (2 * Math.tan(FOV/2));
+          let enemyScreenX = canvas.width / 2 + (Math.tan(enemyRelativeAngle) * enemyDistToProjPlane) - enemySpriteWidth / 2;
+          let enemyScreenY = (canvas.height / 2) - enemySpriteHeight / 2;
+          // Jednoduchá kontrola průsečíku obdélníků
+          if (screenX < enemyScreenX + enemySpriteWidth &&
+              screenX + s > enemyScreenX &&
+              screenY < enemyScreenY + enemySpriteHeight &&
+              screenY + s > enemyScreenY) {
+            // Lekárnička je zakryta nepřítelem – nebudeme ji vykreslovat
+            return;
+          }
+        }
+      }
+      
+      // Pokud není zakryta, vykreslíme ji
+      ctx.save();
+      ctx.translate(screenX, screenY);
+      ctx.fillStyle = "white";
+      ctx.fillRect(0, 0, s, s);
+      ctx.fillStyle = "red";
+      let margin = s * 0.2;       // okrajová mezera
+      let crossThickness = s * 0.2; // tloušťka ramen kříže
+      // Vykreslíme vertikální pruh uprostřed
+      let vertX = (s - crossThickness) / 2;
+      ctx.fillRect(vertX, margin, crossThickness, s - 2 * margin);
+      // Vykreslíme horizontální pruh uprostřed
+      let horizY = (s - crossThickness) / 2;
+      ctx.fillRect(margin, horizY, s - 2 * margin, crossThickness);
+      ctx.restore();
+    }
+  </script>
+</body>
+</html>
